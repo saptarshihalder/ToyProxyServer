@@ -1,0 +1,10 @@
+allowed_hosts:
+  - example.com
+  - anotherdomain.com
+blocked_hosts:
+  - blocked.com
+  - otherblocked.com
+rate_limit: 10
+backends:
+- http://localhost:8000
+- http://localhost:8001

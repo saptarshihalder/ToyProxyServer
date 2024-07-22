@@ -16,4 +16,4 @@ deploymentTarget = "gce"
 
 [[ports]]
 localPort = 8080
-externalPort = 80
+externalPort = 3000

@@ -1,9 +1,9 @@
 package main
 
 import (
+	"compress/gzip"
 	"context"
 	"crypto/tls"
-	"encoding/base64"
 	"flag"
 	"fmt"
 	"io"
@@ -12,25 +12,21 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
-
+	"golang.org/x/time/rate"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"golang.org/x/time/rate"
+	"github.com/hashicorp/golang-lru"
 	"github.com/patrickmn/go-cache"
+	"github.com/sony/gobreaker"
+	"gopkg.in/yaml.v2"
 )
 
 const (
 	bufSize     = 32 * 1024
 	defaultPort = 8080
-	pac         = `
-function FindProxyForURL(url, host) {
-	if (isInNet(host, "10.0.0.0", "255.0.0.0")) return "DIRECT";
-	return "PROXY 10.0.0.2:8080;";
-}`
 )
 
 var (
@@ -41,41 +37,103 @@ var (
 			Name: "proxy_requests_total",
 			Help: "Total number of requests processed by the proxy",
 		},
-		[]string{"method", "status"},
+		[]string{"method", "status", "host"},
 	)
 	bytesTransferred = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "proxy_bytes_transferred",
 			Help: "Total number of bytes transferred through the proxy",
 		},
-		[]string{"direction"},
+		[]string{"direction", "host"},
 	)
-	cacheHits = prometheus.NewCounter(
+	cacheHits = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "proxy_cache_hits",
 			Help: "Total number of cache hits",
 		},
+		[]string{"host"},
+	)
+	circuitBreakerStatus = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Name: "proxy_circuit_breaker_status",
+			Help: "Status of the circuit breaker (0: Closed, 1: Half-Open, 2: Open)",
+		},
+		[]string{"host"},
 	)
 )
 
-type Proxy struct {
-	Transport   http.RoundTripper
-	Credential  string
-	Cache       *cache.Cache
-	RateLimiter *rate.Limiter
+type Config struct {
+	AllowedHosts []string `yaml:"allowed_hosts"`
+	BlockedHosts []string `yaml:"blocked_hosts"`
+	RateLimit    int      `yaml:"rate_limit"`
+	Backends     []string `yaml:"backends"`
 }
 
-func NewProxy() *Proxy {
+type Proxy struct {
+	Transport      http.RoundTripper
+	Credential     string
+	Cache          *cache.Cache
+	RateLimiter    *rate.Limiter
+	Config         *Config
+	CircuitBreaker *gobreaker.CircuitBreaker
+	LoadBalancer   *lru.Cache
+}
+
+func NewProxy(configPath string) (*Proxy, error) {
+	config, err := loadConfig(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	lbCache, _ := lru.New(100) // Cache for load balancing decisions
+
+	cb := gobreaker.NewCircuitBreaker(gobreaker.Settings{
+		Name:        "HTTP_PROXY",
+		MaxRequests: 5,
+		Interval:    10 * time.Second,
+		Timeout:     30 * time.Second,
+		ReadyToTrip: func(counts gobreaker.Counts) bool {
+			failureRatio := float64(counts.TotalFailures) / float64(counts.Requests)
+			return counts.Requests >= 3 && failureRatio >= 0.6
+		},
+		OnStateChange: func(name string, from gobreaker.State, to gobreaker.State) {
+			circuitBreakerStatus.WithLabelValues(name).Set(float64(to))
+		},
+	})
+
 	return &Proxy{
 		Transport: &http.Transport{
 			MaxIdleConns:        100,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
-			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true}, // Note: This is not recommended for production use
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: false},
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				DualStack: true,
+			}).DialContext,
 		},
-		Cache:       cache.New(5*time.Minute, 10*time.Minute),
-		RateLimiter: rate.NewLimiter(rate.Every(time.Second), 100), // 100 requests per second
+		Cache:          cache.New(5*time.Minute, 10*time.Minute),
+		RateLimiter:    rate.NewLimiter(rate.Every(time.Second), config.RateLimit),
+		Config:         config,
+		CircuitBreaker: cb,
+		LoadBalancer:   lbCache,
+	}, nil
+}
+
+func loadConfig(path string) (*Config, error) {
+	file, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
 	}
+
+	var config Config
+	err = yaml.Unmarshal(file, &config)
+	if err != nil {
+		return nil, err
+	}
+
+	return &config, nil
 }
 
 func (p *Proxy) proxyAuthCheck(r *http.Request) bool {
@@ -102,7 +160,33 @@ func (p *Proxy) handleProxyAuth(w http.ResponseWriter, r *http.Request) bool {
 	return false
 }
 
+func (p *Proxy) isAllowed(host string) bool {
+	if len(p.Config.AllowedHosts) == 0 {
+		return !p.isBlocked(host)
+	}
+	for _, allowed := range p.Config.AllowedHosts {
+		if strings.HasSuffix(host, allowed) {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Proxy) isBlocked(host string) bool {
+	for _, blocked := range p.Config.BlockedHosts {
+		if strings.HasSuffix(host, blocked) {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Proxy) handleTunnel(w http.ResponseWriter, r *http.Request) {
+	if !p.isAllowed(r.Host) {
+		http.Error(w, "Access to this host is not allowed", http.StatusForbidden)
+		return
+	}
+
 	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
@@ -122,60 +206,80 @@ func (p *Proxy) handleTunnel(w http.ResponseWriter, r *http.Request) {
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go transfer(&wg, destConn, clientConn)
-	go transfer(&wg, clientConn, destConn)
+	go transfer(&wg, destConn, clientConn, r.Host)
+	go transfer(&wg, clientConn, destConn, r.Host)
 	wg.Wait()
 }
 
-func transfer(wg *sync.WaitGroup, destination io.WriteCloser, source io.ReadCloser) {
+func transfer(wg *sync.WaitGroup, destination io.WriteCloser, source io.ReadCloser, host string) {
 	defer wg.Done()
 	defer destination.Close()
 	defer source.Close()
 	n, _ := io.Copy(destination, source)
-	bytesTransferred.WithLabelValues("out").Add(float64(n))
+	bytesTransferred.WithLabelValues("out", host).Add(float64(n))
 }
 
 func (p *Proxy) modifyRequest(r *http.Request) {
-	// Example: Add a custom header
-	r.Header.Add("X-Proxied-By", "GoProxy")
-
-	// Example: Block certain domains
-	if strings.Contains(r.Host, "blocked-domain.com") {
-		r.URL = nil // This will cause the request to fail
-	}
+	r.Header.Set("X-Forwarded-For", r.RemoteAddr)
+	r.Header.Set("X-Proxied-By", "AdvancedGoProxy")
 }
 
 func (p *Proxy) modifyResponse(resp *http.Response) {
-	// Example: Add a custom header
-	resp.Header.Add("X-Proxy-Info", "Modified by GoProxy")
+	resp.Header.Set("X-Proxy-Info", "Modified by AdvancedGoProxy")
+}
 
-	// Example: Modify content (be careful with this!)
-	if resp.Header.Get("Content-Type") == "text/html" {
-		body, err := io.ReadAll(resp.Body)
-		if err == nil {
-			modifiedBody := strings.ReplaceAll(string(body), "</body>", "<footer>Modified by GoProxy</footer></body>")
-			resp.Body = io.NopCloser(strings.NewReader(modifiedBody))
-			resp.ContentLength = int64(len(modifiedBody))
-			resp.Header.Set("Content-Length", fmt.Sprint(len(modifiedBody)))
-		}
+func (p *Proxy) loadBalance(r *http.Request) {
+	backends := p.Config.Backends
+	if len(backends) == 0 {
+		return
+	}
+
+	if host, ok := p.LoadBalancer.Get(r.Host); ok {
+		index := (host.(int) + 1) % len(backends)
+		p.LoadBalancer.Add(r.Host, index)
+		r.URL.Host = backends[index]
+	} else {
+		p.LoadBalancer.Add(r.Host, 0)
+		r.URL.Host = backends[0]
 	}
 }
 
+func (p *Proxy) compressResponse(w http.ResponseWriter, r *http.Request, resp *http.Response) error {
+	if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		return nil
+	}
+
+	gz := gzip.NewWriter(w)
+	defer gz.Close()
+
+	w.Header().Set("Content-Encoding", "gzip")
+	w.Header().Del("Content-Length")
+
+	_, err := io.Copy(gz, resp.Body)
+	return err
+}
+
+func (p *Proxy) logRequest(r *http.Request, statusCode int, responseTime time.Duration) {
+	logger.Printf(
+		"%s - %s %s %s %d %v",
+		r.RemoteAddr,
+		r.Method,
+		r.URL.Path,
+		r.Proto,
+		statusCode,
+		responseTime,
+	)
+}
+
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+
 	if !p.handleProxyAuth(w, r) {
 		return
 	}
 
-	if !p.RateLimiter.Allow() {
-		http.Error(w, "Rate limit exceeded", http.StatusTooManyRequests)
-		return
-	}
-
-	logger.Printf("Received request %s %s from %s", r.Method, r.Host, r.RemoteAddr)
-
-	if r.URL.Path == "/pac" {
-		w.Header().Set("Content-Type", "application/x-ns-proxy-autoconfig")
-		w.Write([]byte(pac))
+	if !p.isAllowed(r.Host) {
+		http.Error(w, "Access to this host is not allowed", http.StatusForbidden)
 		return
 	}
 
@@ -184,98 +288,73 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check cache
-	if cachedResp, found := p.Cache.Get(r.URL.String()); found {
-		cacheHits.Inc()
-		w.WriteHeader(http.StatusOK)
-		w.Write(cachedResp.([]byte))
-		return
-	}
-
 	p.modifyRequest(r)
+	p.loadBalance(r)
 
-	resp, err := p.Transport.RoundTrip(r)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		requestsTotal.WithLabelValues(r.Method, fmt.Sprintf("%d", http.StatusBadGateway)).Inc()
-		return
-	}
-	defer resp.Body.Close()
-
-	p.modifyResponse(resp)
-
-	for k, vv := range resp.Header {
-		for _, v := range vv {
-			w.Header().Add(k, v)
-		}
-	}
-	w.WriteHeader(resp.StatusCode)
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		logger.Printf("Error reading response body: %v", err)
+	if cachedResp, found := p.Cache.Get(r.URL.String()); found {
+		cachedResp.(*http.Response).Write(w)
+		cacheHits.WithLabelValues(r.Host).Inc()
 		return
 	}
 
-	// Cache the response
-	p.Cache.Set(r.URL.String(), body, cache.DefaultExpiration)
+	resp, err := p.CircuitBreaker.Execute(func() (interface{}, error) {
+		return p.Transport.RoundTrip(r)
+	})
+	if err != nil {
+		http.Error(w, "Service unavailable", http.StatusServiceUnavailable)
+		return
+	}
 
-	n, _ := w.Write(body)
-	bytesTransferred.WithLabelValues("in").Add(float64(n))
-	requestsTotal.WithLabelValues(r.Method, fmt.Sprintf("%d", resp.StatusCode)).Inc()
+	p.modifyResponse(resp.(*http.Response))
+
+	if err := p.compressResponse(w, r, resp.(*http.Response)); err != nil {
+		http.Error(w, "Failed to compress response", http.StatusInternalServerError)
+		return
+	}
+
+	p.Cache.Set(r.URL.String(), resp.(*http.Response), cache.DefaultExpiration)
+	requestsTotal.WithLabelValues(r.Method, fmt.Sprint(resp.(*http.Response).StatusCode), r.Host).Inc()
+
+	responseTime := time.Since(start)
+	bytesTransferred.WithLabelValues("in", r.Host).Add(float64(resp.(*http.Response).ContentLength))
+	p.logRequest(r, resp.(*http.Response).StatusCode, responseTime)
 }
 
 func main() {
-	addr := flag.String("addr", fmt.Sprintf(":%d", defaultPort), "listen address")
-	auth := flag.String("auth", "", "http auth, eg: susan:hello-kitty")
-	certFile := flag.String("cert", "", "path to certificate file")
-	keyFile := flag.String("key", "", "path to key file")
+	configPath := flag.String("config", "config.yaml", "Path to configuration file")
+	listenAddr := flag.String("listen", fmt.Sprintf(":%d", defaultPort), "Address to listen on for incoming requests")
 	flag.Parse()
 
-	prometheus.MustRegister(requestsTotal, bytesTransferred, cacheHits)
-
-	proxy := NewProxy()
-	if *auth != "" {
-		proxy.Credential = base64.StdEncoding.EncodeToString([]byte(*auth))
+	proxy, err := NewProxy(*configPath)
+	if err != nil {
+		logger.Fatalf("Error initializing proxy: %v", err)
 	}
 
+	http.Handle("/metrics", promhttp.Handler())
+	http.Handle("/", proxy)
+
+	server := &http.Server{Addr: *listenAddr}
+
 	go func() {
-		for {
-			logger.Printf("Active goroutines: %d", runtime.NumGoroutine())
-			time.Sleep(30 * time.Second)
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			logger.Fatalf("Error starting server: %v", err)
 		}
 	}()
 
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.Handler())
-	mux.Handle("/", proxy)
+	logger.Printf("Proxy server is listening on %s", *listenAddr)
 
-	server := &http.Server{
-		Addr:         *addr,
-		Handler:      mux,
-		ReadTimeout:  1 * time.Minute,
-		WriteTimeout: 1 * time.Minute,
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, os.Interrupt)
+	<-quit
+
+	logger.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := server.Shutdown(ctx); err != nil {
+		logger.Fatalf("Error shutting down server: %v", err)
 	}
 
-	go func() {
-		sigint := make(chan os.Signal, 1)
-		signal.Notify(sigint, os.Interrupt)
-		<-sigint
-
-		logger.Println("Shutting down server...")
-		if err := server.Shutdown(context.Background()); err != nil {
-			logger.Printf("HTTP server Shutdown: %v", err)
-		}
-	}()
-
-	logger.Printf("Proxy server listening on %s", *addr)
-	var err error
-	if *certFile != "" && *keyFile != "" {
-		err = server.ListenAndServeTLS(*certFile, *keyFile)
-	} else {
-		err = server.ListenAndServe()
-	}
-	if err != http.ErrServerClosed {
-		log.Fatal(err)
-	}
+	logger.Println("Server gracefully stopped")
 }
